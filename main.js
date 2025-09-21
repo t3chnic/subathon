@@ -1,32 +1,34 @@
-/* main.js — StreamElements Subathon Timer (single-file, hostable)
+/* main.js — StreamElements Subathon Timer (stable init, no debug)
+   Version: 1.4.0
+
    Features:
-   - No end date; delta-based (freeze-safe)
-   - Persistent across reloads using SE_API.store
-   - Chat commands: !addtime / !subtime with h/m/s and HH:MM:SS
-   - Role gating (broadcaster / mods / everyone)
-   - Click overlay: click = pause/resume, Shift+click = reset
+   - No end date; delta (freeze-safe)
+   - Persistent via SE_API.store (reload/crash-safe)
+   - Chat commands: !addtime / !subtime (h/m/s and HH:MM:SS)
+   - Role gating: broadcaster | mods | everyone
+   - Tier multipliers (t1/t2/t3/prime) + options for gifts & resub months
 */
 
 (() => {
   // ---------- DOM bootstrap ----------
-  const rootId = 'se-subathon-root';
-  if (!document.getElementById(rootId)) {
-    const $root = document.createElement('div');
-    $root.id = rootId;
-    $root.style.position = 'relative';
-    $root.innerHTML = `
+  const ROOT_ID = 'se-subathon-root';
+  function mountDOM() {
+    if (document.getElementById(ROOT_ID)) return;
+
+    const root = document.createElement('div');
+    root.id = ROOT_ID;
+    root.style.position = 'relative';
+    root.innerHTML = `
       <div id="se-subathon-label" style="display:none;"></div>
       <div id="se-subathon-time">00:00:00</div>
       <div id="se-subathon-fb" style="position:absolute;top:-2.2em;left:50%;transform:translateX(-50%);opacity:0;pointer-events:none;white-space:nowrap;"></div>
       <div id="se-subathon-ctrl" title="Click: pause/resume • Shift+Click: reset" style="position:absolute;inset:0;"></div>
     `;
-    document.body.appendChild($root);
+    document.body.appendChild(root);
 
-    // Base style (overridden on load with fields)
     const style = document.createElement('style');
-    style.id = 'se-subathon-style';
     style.textContent = `
-      #${rootId}{
+      #${ROOT_ID}{
         display:inline-flex;flex-direction:column;align-items:center;gap:6px;
         padding:8px 12px;border-radius:12px;background:rgba(0,0,0,0)
       }
@@ -46,15 +48,59 @@
     `;
     document.head.appendChild(style);
   }
+  mountDOM();
 
-  // ---------- State & refs ----------
-  let fields = {};
-  let STORE_KEY = 'subathon-timer-v1';
+  // ---------- Baseline defaults (work even if onWidgetLoad is missed) ----------
+  let fields = {
+    // timer
+    startSeconds: 3600,
+    autostart: true,
+    pauseOnZero: true,
+    storageKey: 'subathon-timer-v1',
+
+    // adds
+    subSeconds: 60,
+    resubPerMonthSeconds: 0,
+    giftSubSeconds: 60,
+    bitsPerSecond: 10,
+    tipPerSecond: 1,
+
+    // look
+    showLabel: true,
+    labelText: 'Subathon Time Remaining',
+    fontFamily: 'Bebas Neue',
+    fontSize: 64,
+    textColor: '#ffffff',
+    bgColor: 'rgba(0,0,0,0)',
+    bold: true,
+    shadow: true,
+
+    // chat commands (ON by default)
+    enableChatCommands: true,
+    addTimeCommand: '!addtime',
+    subTimeCommand: '!subtime',
+    whoCanUse: 'mods', // 'broadcaster' | 'mods' | 'everyone'
+    commandFeedback: true,
+    feedbackFormat: '{user} {op} {delta} → {remaining}',
+
+    // tier multipliers
+    t1Mult: 1,
+    t2Mult: 2,
+    t3Mult: 6,
+    primeMult: 1,
+    applyTierToGifts: true,
+    applyTierToResubMonths: true
+  };
+
+  // ---------- State ----------
+  let STORE_KEY = fields.storageKey;
   let state = { remaining: 0, isRunning: false, lastWallClock: Date.now() };
   let rafId = null;
   let lastPersist = 0;
+  let didInit = false; // for fallback bootstrap
 
-  const $root = document.getElementById(rootId);
+  // ---------- Refs ----------
+  const $root  = document.getElementById(ROOT_ID);
   const $label = document.getElementById('se-subathon-label');
   const $time  = document.getElementById('se-subathon-time');
   const $fb    = document.getElementById('se-subathon-fb');
@@ -78,20 +124,17 @@
   function parseDuration(input) {
     if (!input || typeof input !== 'string') return 0;
     const str = input.trim().toLowerCase();
-
     // HH:MM:SS or MM:SS
     if (/^\d{1,2}:\d{1,2}(:\d{1,2})?$/.test(str)) {
       const parts = str.split(':').map(n => parseInt(n,10));
       if (parts.length === 2) { const [mm, ss] = parts; return mm*60 + ss; }
       if (parts.length === 3) { const [hh, mm, ss] = parts; return hh*3600 + mm*60 + ss; }
     }
-
-    // Mixed h/m/s
-    let total = 0; let m;
+    // h/m/s mix
+    let total = 0, m;
     const rx = /(\d+)\s*(h|m|s)?/g;
     while ((m = rx.exec(str)) !== null) {
-      const v = parseInt(m[1],10);
-      const u = m[2] || 's';
+      const v = parseInt(m[1],10), u = m[2] || 's';
       if (u === 'h') total += v * 3600;
       else if (u === 'm') total += v * 60;
       else total += v;
@@ -121,15 +164,15 @@
 
   function applyStyle() {
     const font = (fields.fontFamily || 'Bebas Neue').trim();
-    // Inject Google Font link once per font
+    // Inject Google Font
     const linkId = 'se-subathon-font';
-    const existing = document.getElementById(linkId);
     const href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(font)}&display=swap`;
-    if (!existing || existing.getAttribute('href') !== href) {
-      if (existing) existing.remove();
-      const l = document.createElement('link');
-      l.id = linkId; l.rel = 'stylesheet'; l.href = href;
-      document.head.appendChild(l);
+    let link = document.getElementById(linkId);
+    if (!link || link.getAttribute('href') !== href) {
+      if (link) link.remove();
+      link = document.createElement('link');
+      link.id = linkId; link.rel = 'stylesheet'; link.href = href;
+      document.head.appendChild(link);
     }
 
     const size = Number(fields.fontSize || 64);
@@ -142,7 +185,6 @@
     $label.style.display = fields.showLabel ? 'block' : 'none';
     $label.textContent = fields.labelText || 'Subathon Time Remaining';
 
-    // apply font + sizes
     [$label, $time, $fb].forEach(el => {
       el.style.fontFamily = `'${font}', system-ui, sans-serif`;
       el.style.color = txt;
@@ -154,31 +196,6 @@
     $time.style.textShadow = shadow;
     $fb.style.fontSize = Math.max(12, Math.round(size * 0.28)) + 'px';
     $fb.style.textShadow = shadow;
-  }
-
-  function getTierCode(ev) {
-    // Normalize common shapes: ev.tier, ev.plan ('1000','2000','3000'), prime flags
-    const d = ev.data || ev;
-    const rawTier = (d.tier || d.plan || '').toString().toLowerCase();
-    const isPrime = d.isPrime || d.prime || /prime/.test(rawTier);
-  
-    // Twitch plans: 1000=T1, 2000=T2, 3000=T3. Some payloads use 'tier1', 'tier2', 'tier3'
-    if (isPrime) return 'prime';
-    if (rawTier.includes('3000') || rawTier.includes('tier3')) return 't3';
-    if (rawTier.includes('2000') || rawTier.includes('tier2')) return 't2';
-    if (rawTier.includes('1000') || rawTier.includes('tier1')) return 't1';
-  
-    // If nothing explicit, assume Tier 1 (safest)
-    return 't1';
-  }
-  
-  function getTierMultiplier(code) {
-    switch (code) {
-      case 't3':   return Number(fields.t3Mult ?? 6);
-      case 't2':   return Number(fields.t2Mult ?? 2);
-      case 'prime':return Number(fields.primeMult ?? 1);
-      default:     return Number(fields.t1Mult ?? 1);
-    }
   }
 
   // ---------- Persistence ----------
@@ -195,16 +212,13 @@
         }
       }
     } catch (e) {
-      console.warn('SE_API.store.get failed', e);
+      // ignore; widget still runs with defaults
     }
   }
 
   async function persist() {
-    try {
-      await SE_API.store.set(STORE_KEY, state);
-    } catch (e) {
-      console.warn('SE_API.store.set failed', e);
-    }
+    try { await SE_API.store.set(STORE_KEY, state); }
+    catch (e) { /* ignore */ }
   }
 
   async function initFresh() {
@@ -227,7 +241,6 @@
       persist();
     }
 
-    // periodic persist
     if (t - lastPersist > 3000) { lastPersist = t; persist(); }
 
     rafId = requestAnimationFrame(tick);
@@ -242,47 +255,60 @@
     persist();
   }
 
+  // ---------- Subs / Bits / Tips ----------
+  function getTierCode(ev) {
+    const d = ev.data || ev;
+    const rawTier = (d.tier || d.plan || '').toString().toLowerCase();
+    const isPrime = d.isPrime || d.prime || /prime/.test(rawTier);
+    if (isPrime) return 'prime';
+    if (rawTier.includes('3000') || rawTier.includes('tier3')) return 't3';
+    if (rawTier.includes('2000') || rawTier.includes('tier2')) return 't2';
+    if (rawTier.includes('1000') || rawTier.includes('tier1')) return 't1';
+    return 't1';
+  }
+  
+  function getTierMultiplier(code) {
+    switch (code) {
+      case 't3': return Number(fields.t3Mult ?? 6);
+      case 't2': return Number(fields.t2Mult ?? 2);
+      case 'prime': return Number(fields.primeMult ?? 1);
+      default: return Number(fields.t1Mult ?? 1);
+    }
+  }
+
   function handleSubscriber(ev) {
     const d = ev.data || ev;
-
-    // Detect gift vs normal sub; count may be in amount/count
     const isGift = !!d.gifted || !!d.bulkGifted || d.isGift;
     const count  = Number(d.amount || d.count || 1) || 1;
-
     const tierCode = getTierCode(d);
     const mult = getTierMultiplier(tierCode);
 
     if (isGift) {
-      // Gifted subs: multiply the per-gift seconds by count and (optionally) tier
       const base = Number(fields.giftSubSeconds) || 0;
-      const applyTier = !!fields.applyTierToGifts;
-      const perGift = applyTier ? base * mult : base;
+      const perGift = fields.applyTierToGifts ? base * mult : base;
       addSeconds(count * perGift);
       return;
     }
 
-    // New sub / resub
     const baseSub = (Number(fields.subSeconds) || 0) * mult;
     addSeconds(baseSub);
 
-    // Resub months bonus (optional) — often ev.amount/months carries total months
     const months = Number(d.months || d.amount || 0) || 0;
     if (months > 1) {
       const perMonth = Number(fields.resubPerMonthSeconds) || 0;
-      const applyTierMonths = !!fields.applyTierToResubMonths;
-      const perExtra = applyTierMonths ? perMonth * mult : perMonth;
+      const perExtra = fields.applyTierToResubMonths ? perMonth * mult : perMonth;
       addSeconds((months - 1) * perExtra);
     }
   }
 
   function handleCheer(ev) {
-    const bits = Number(ev.amount || ev.bits || 0) || 0;
+    const bits = Number((ev.data || ev).amount || (ev.data || ev).bits || 0) || 0;
     const bps = Math.max(1, Number(fields.bitsPerSecond) || 10);
     addSeconds(Math.floor(bits / bps));
   }
 
   function handleTip(ev) {
-    const amount = Number(ev.amount || 0) || 0;
+    const amount = Number((ev.data || ev).amount || 0) || 0;
     const per = Math.max(0.01, Number(fields.tipPerSecond) || 1);
     addSeconds(Math.floor(amount / per));
   }
@@ -309,11 +335,13 @@
     if (who === 'broadcaster') return !!u.isBroadcaster;
     return !!(u.isBroadcaster || u.isMod);
   }
+
   function handleChatCommand(ev) {
     const textRaw = getMessageText(ev);
     if (!textRaw) return;
-    const text = textRaw.trim();
 
+    const text = textRaw.trim();
+    // Commands (lowercased for matching)
     const addCmd = (fields.addTimeCommand || '!addtime').toLowerCase();
     const subCmd = (fields.subTimeCommand || '!subtime').toLowerCase();
     const lower = text.toLowerCase();
@@ -346,14 +374,13 @@
     showFeedback(fbText);
   }
 
-  // ---------- Event routing (reliable) ----------
+  // ---------- Event routing ----------
   window.addEventListener('onEventReceived', function (obj) {
     if (!obj || !obj.detail) return;
-
     const listener = obj.detail.listener || '';
     const ev = obj.detail.event || {};
 
-    if (listener === 'message-received') {
+    if (listener === 'message') {
       if (fields.enableChatCommands) handleChatCommand(ev);
       return;
     }
@@ -378,47 +405,21 @@
     }
   });
 
-  // ---------- Boot ----------
-  window.addEventListener('onWidgetLoad', async function (obj) {
-    fields = (obj && obj.detail && obj.detail.fieldData) || {};
+  // ---------- Init (normal path) ----------
+  async function initWith(obj) {
+    if (didInit) return;
+    didInit = true;
 
-    // Defaults for when you only host JS
-    fields.startSeconds ??= 3600;
-    fields.autostart ??= true;
-    fields.pauseOnZero ??= true;
-    fields.storageKey ??= 'subathon-timer-v1';
-    fields.subSeconds ??= 60;
-    fields.resubPerMonthSeconds ??= 0;
-    fields.giftSubSeconds ??= 60;
-    fields.bitsPerSecond ??= 10;
-    fields.tipPerSecond ??= 1;
-    fields.showLabel ??= true;
-    fields.labelText ??= 'Subathon Time Remaining';
-    fields.fontFamily ??= 'Bebas Neue';
-    fields.fontSize ??= 64;
-    fields.textColor ??= '#ffffff';
-    fields.bgColor ??= 'rgba(0,0,0,0)';
-    fields.bold ??= true;
-    fields.shadow ??= true;
-    fields.enableChatCommands ??= true;
-    fields.addTimeCommand ??= '!addtime';
-    fields.subTimeCommand ??= '!subtime';
-    fields.whoCanUse ??= 'mods'; // 'broadcaster' | 'mods' | 'everyone'
-    fields.commandFeedback ??= true;
-    fields.feedbackFormat ??= '{user} {op} {delta} → {remaining}';
-    fields.t1Mult ??= 1;
-    fields.t2Mult ??= 2;
-    fields.t3Mult ??= 6;
-    fields.primeMult ??= 1;
-    fields.applyTierToGifts ??= true;
-    fields.applyTierToResubMonths ??= true;
-
+    // Merge real field data if present
+    if (obj && obj.detail && obj.detail.fieldData) {
+      Object.assign(fields, obj.detail.fieldData);
+    }
     STORE_KEY = (fields.storageKey || 'subathon-timer-v1').trim();
-    applyStyle();
 
+    applyStyle();
     await loadPersisted();
 
-    // If nothing existed yet, init fresh
+    // If nothing persisted, start fresh
     try {
       const existing = await SE_API.store.get(STORE_KEY);
       if (!existing || typeof existing.remaining !== 'number') {
@@ -426,6 +427,7 @@
       }
     } catch { /* ignore */ }
 
+    // Ensure autostart
     if (fields.autostart && state.remaining > 0) {
       state.isRunning = true;
       state.lastWallClock = now();
@@ -434,5 +436,19 @@
 
     if (rafId) cancelAnimationFrame(rafId);
     rafId = requestAnimationFrame(tick);
-  });
+  }
+
+  window.addEventListener('onWidgetLoad', initWith);
+
+  // ---------- Fallback bootstrap ----------
+  // If onWidgetLoad was missed (load-order edge case), start with defaults after a short delay.
+  setTimeout(() => { if (!didInit) initWith(null); }, 1500);
+
+  // ---------- Optional tiny API for manual checks (kept minimal, no debug UI) ----------
+  window.SubathonTimer = {
+    version: '1.4.0',
+    getState: () => ({ ...state }),
+    add: (s) => addSeconds(Number(s)||0),
+    reset: () => initFresh()
+  };
 })();
