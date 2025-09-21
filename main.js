@@ -346,17 +346,6 @@
     showFeedback(fbText);
   }
 
-  // ---------- Click controls ----------
-  $ctrl.addEventListener('click', async (e) => {
-    if (e.shiftKey) {
-      await initFresh();
-    } else {
-      state.isRunning = !state.isRunning;
-      state.lastWallClock = now();
-      await persist();
-    }
-  });
-
   // ---------- Event routing (reliable) ----------
   window.addEventListener('onEventReceived', function (obj) {
     if (!obj || !obj.detail) return;
